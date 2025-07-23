@@ -1,6 +1,6 @@
 #pragma once
 
-using "TradeInfo.h"
+#include "TradeInfo.h"
 
 class Trade {
     public:
