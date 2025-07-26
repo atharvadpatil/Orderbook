@@ -82,6 +82,8 @@ void Orderbook::CancelOrderInternal(OrderId orderId) {
 		if (orders.empty())
 			bids_.erase(price);
 	}
+
+    OnOrderCancelled(order);
 }
 
 Orderbook::Orderbook() : ordersPruneThread_{ [this] { PruneGoodForDayOrders(); } } { }
@@ -90,6 +92,33 @@ Orderbook::~Orderbook() {
     shutdown_.store(true, std::memory_order_release);
 	shutdownConditionVariable_.notify_one();
 	ordersPruneThread_.join();
+}
+
+void Orderbook::OnOrderCancelled(OrderPointer order) {
+	UpdateLevelData(order->GetPrice(), order->GetRemainingQuantity(), LevelData::Action::Remove);
+}
+
+void Orderbook::OnOrderAdded(OrderPointer order) {
+	UpdateLevelData(order->GetPrice(), order->GetInitialQuantity(), LevelData::Action::Add);
+}
+
+void Orderbook::OnOrderMatched(Price price, Quantity quantity, bool isFullyFilled) {
+	UpdateLevelData(price, quantity, isFullyFilled ? LevelData::Action::Remove : LevelData::Action::Match);
+}
+
+void Orderbook::UpdateLevelData(Price price, Quantity quantity, LevelData::Action action) {
+	auto& data = data_[price];
+
+	data.count_ += action == LevelData::Action::Remove ? -1 : action == LevelData::Action::Add ? 1 : 0;
+	if (action == LevelData::Action::Remove || action == LevelData::Action::Match) {
+		data.quantity_ -= quantity;
+	}
+	else {
+		data.quantity_ += quantity;
+	}
+
+	if (data.count_ == 0)
+		data_.erase(price);
 }
 
 bool Orderbook::CanMatch(Side side, Price price) const {
@@ -107,6 +136,41 @@ bool Orderbook::CanMatch(Side side, Price price) const {
         const auto& [bestbid, _] = *bids_.begin();
         return price <= bestbid;
     }
+}
+
+bool Orderbook::CanFullyFill(Side side, Price price, Quantity quantity) const
+{
+	if (!CanMatch(side, price))
+		return false;
+
+	std::optional<Price> threshold;
+
+	if (side == Side::Buy) {
+		const auto [askPrice, _] = *asks_.begin();
+		threshold = askPrice;
+	}
+	else {
+		const auto [bidPrice, _] = *bids_.begin();
+		threshold = bidPrice;
+	}
+
+	for (const auto& [levelPrice, levelData] : data_) {
+		if (threshold.has_value() &&
+			(side == Side::Buy && threshold.value() > levelPrice) ||
+			(side == Side::Sell && threshold.value() < levelPrice))
+			continue;
+
+		if ((side == Side::Buy && levelPrice > price) ||
+			(side == Side::Sell && levelPrice < price))
+			continue;
+
+		if (quantity <= levelData.quantity_)
+			return true;
+
+		quantity -= levelData.quantity_;
+	}
+
+	return false;
 }
 
 Trades Orderbook::MatchOrders() {
@@ -132,26 +196,33 @@ Trades Orderbook::MatchOrders() {
             bid->Fill(quantity);
             ask->Fill(quantity);
 
-            if(bid->IsFilled()){
+            if(bid->IsFilled()) {
                 bids.pop_front();
                 orders_.erase(bid->GetOrderId());
             }
 
-            if(ask->IsFilled()){
+            if(ask->IsFilled()) {
                 asks.pop_front();
                 orders_.erase(ask->GetOrderId());
             }
 
-            if(bids.empty())
+            if(bids.empty()) {
                 bids_.erase(bidPrice);
+                data_.erase(bidPrice);
+            }
 
-            if(asks.empty())
+            if(asks.empty()) {
                 asks_.erase(askPrice);
+                data_.erase(askPrice);
+            }
 
             trades.push_back(Trade{
                 TradeInfo{ bid->GetOrderId(), bid->GetPrice(), quantity },
                 TradeInfo{ ask->GetOrderId(), ask->GetPrice(), quantity }
             });
+
+            OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
+			OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
         }
     }
     if(!bids_.empty()) {
@@ -195,6 +266,9 @@ Trades Orderbook::AddOrder(OrderPointer order) {
     if(order->GetOrderType() == OrderType::FillAndKill && !CanMatch(order->GetSide(), order->GetPrice()))
         return { };
 
+    if (order->GetOrderType() == OrderType::FillOrKill && !CanFullyFill(order->GetSide(), order->GetPrice(), order->GetInitialQuantity()))
+		return { };
+
     OrderPointers::iterator iterator;
 
     if(order->GetSide() == Side::Buy) {
@@ -209,6 +283,7 @@ Trades Orderbook::AddOrder(OrderPointer order) {
     }
 
     orders_.insert({ order->GetOrderId(), OrderEntry{order, iterator} });
+    OnOrderAdded(order);
     return MatchOrders();
 }
 
