@@ -10,6 +10,7 @@
 #include "Order.h"
 #include "OrderModify.h"
 #include "Trade.h"
+#include "OrderbookLevelInfos.h"
 
 class Orderbook {
     private:
@@ -65,4 +66,6 @@ class Orderbook {
         void CancelOrder(OrderId orderId);
         Trades ModifyOrder(OrderModify order);
         std::size_t Size() const;
+
+        OrderbookLevelInfos GetOrderInfos() const;
 };
